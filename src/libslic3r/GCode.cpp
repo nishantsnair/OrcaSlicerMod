@@ -21,6 +21,7 @@
 #include "libslic3r/format.hpp"
 #include "Time.hpp"
 #include "GCode/ExtrusionProcessor.hpp"
+#include "Flow.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -31,6 +32,8 @@
 #include <string>
 #include <utility>
 #include <string_view>
+#include <limits>
+#include <sstream>
 
 #include <regex>
 #include <boost/algorithm/string.hpp>
@@ -2854,6 +2857,7 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
 
     // Set other general things.
     file.write(this->preamble());
+    this->emit_instance_purge_lines(file, print, initial_extruder_id);
 
     // Calculate wiping points if needed
     DoExport::init_ooze_prevention(print, m_ooze_prevention);
@@ -5203,6 +5207,121 @@ std::string GCode::preamble()
     m_writer.travel_to_z(m_config.z_offset.value);
 
     return gcode;
+}
+
+void GCode::emit_instance_purge_lines(GCodeOutputStream &file, const Print &print, unsigned int extruder_id)
+{
+    constexpr double purge_length_mm = 300.0;
+    constexpr double purge_offset_mm = 10.0;
+    constexpr double bed_margin_mm   = 0.2;
+    constexpr double min_travel_mm   = 0.5;
+
+    if (print.objects().empty())
+        return;
+
+    Points bed_shape = get_bed_shape(print.config());
+    if (bed_shape.empty())
+        return;
+
+    double bed_max_y = std::numeric_limits<double>::lowest();
+    for (const Point &pt : bed_shape)
+        bed_max_y = std::max(bed_max_y, unscale<double>(pt.y()));
+    if (!std::isfinite(bed_max_y))
+        return;
+
+    if (extruder_id >= m_config.nozzle_diameter.values.size())
+        return;
+
+    const Extruder *active_extruder = m_writer.filament();
+    if (active_extruder == nullptr)
+        return;
+
+    double layer_height = print.config().initial_layer_print_height.value;
+    if (layer_height <= 0.)
+        return;
+
+    Flow purge_flow = Flow::new_from_config_width(
+        frPerimeter,
+        m_config.initial_layer_line_width,
+        m_config.nozzle_diameter.get_at(extruder_id),
+        layer_height);
+    double e_per_mm = active_extruder->e_per_mm(purge_flow.mm3_per_mm());
+    if (e_per_mm <= 0.)
+        return;
+
+    double purge_speed = m_config.get_abs_value("initial_layer_speed");
+    double purge_z     = layer_height + m_config.z_offset.value;
+
+    bool moved_to_purge_height = false;
+
+    size_t object_index = 0;
+    for (const PrintObject *object : print.objects()) {
+        size_t instance_index = 0;
+        for (const PrintInstance &instance : object->instances()) {
+            BoundingBoxf3 bbox = instance.get_bounding_box();
+            if (!bbox.defined()) {
+                ++ instance_index;
+                continue;
+            }
+
+            double center_x = 0.5 * (bbox.min.x() + bbox.max.x());
+            double start_y  = bbox.max().y() + purge_offset_mm;
+            double max_y    = bed_max_y - bed_margin_mm;
+            double available_travel = max_y - start_y;
+            if (available_travel <= min_travel_mm) {
+                ++ instance_index;
+                continue;
+            }
+
+            if (!moved_to_purge_height) {
+                file.write(m_writer.travel_to_z(purge_z, "Move to purge height"));
+                moved_to_purge_height = true;
+            }
+
+            Point start_point = Point::new_scale(center_x, start_y);
+            {
+                std::ostringstream comment;
+                comment << "Move to purge start (object " << object_index << ", instance " << instance_index << ")";
+                file.write(this->travel_to(start_point, erNone, comment.str()));
+            }
+
+            if (purge_speed > 0.)
+                file.write(m_writer.set_speed(purge_speed * 60., "Set purge speed"));
+
+            std::ostringstream purge_comment_stream;
+            purge_comment_stream << "purge before object " << object_index << " instance " << instance_index;
+            const std::string purge_comment = purge_comment_stream.str();
+
+            double remaining_length = purge_length_mm;
+            double current_y        = start_y;
+            bool   going_up         = true;
+            const double limit_top  = start_y + available_travel;
+
+            while (remaining_length > min_travel_mm) {
+                double limit = going_up ? (limit_top - current_y) : (current_y - start_y);
+                if (limit <= min_travel_mm) {
+                    going_up = !going_up;
+                    continue;
+                }
+
+                double segment = std::min(remaining_length, limit);
+                double target_y = going_up ? current_y + segment : current_y - segment;
+                Point  target_point = Point::new_scale(center_x, target_y);
+                Vec2d  target_xy    = this->point_to_gcode(target_point);
+                double dE           = segment * e_per_mm;
+
+                file.write(m_writer.extrude_to_xy(target_xy, dE, purge_comment));
+
+                remaining_length -= segment;
+                current_y = target_y;
+                if (limit - segment <= min_travel_mm)
+                    going_up = !going_up;
+            }
+
+            ++ instance_index;
+        }
+        ++ object_index;
+    }
 }
 
 // called by GCode::process_layer()

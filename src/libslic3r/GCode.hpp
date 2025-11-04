@@ -384,6 +384,7 @@ private:
     bool            last_pos_defined() const { return m_last_pos_defined; }
     void            set_extruders(const std::vector<unsigned int> &extruder_ids);
     std::string     preamble();
+    void            emit_instance_purge_lines(GCodeOutputStream &file, const Print &print, unsigned int extruder_id);
     // BBS
     std::string     change_layer(coordf_t print_z);
     // Orca: pass the complete collection of region perimeters to the extrude loop to check whether the wipe before external loop
